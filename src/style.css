@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+。blur-img {
+  filter: blur(10px);
+  transition: filter 0.3s ease;
+}
+
+.blur-img.loaded {
+  filter: blur(0);
+}
