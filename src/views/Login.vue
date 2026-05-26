@@ -23,7 +23,7 @@ const login = async () => {
   } else {
     toast.success('登陆成功', { timeout: 2000 })
     setTimeout(() => {
-      router.push("/home")
+      router.push("/")
     }, 2000)
   }
 }
