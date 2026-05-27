@@ -1,263 +1,653 @@
 <script>
-import AmuletCard from '../components/AmuletCard.vue';
-import NavBar from '../components/NavBar.vue';
+import AmuletCard from '../components/AmuletCard.vue'
+import NavBar from '../components/NavBar.vue'
+
 import { supabase } from '../lib/supabase'
+import { feedCache } from '../cache/feedCache'
 
 export default {
+
     components: {
         NavBar,
         AmuletCard
     },
 
     data() {
+
         return {
+
+            // =====================
+            // feed
+            // =====================
             posts: [],
 
+            // =====================
+            // states
+            // =====================
             loading: false,
             refreshing: false,
-
-            page: 0,
-            pageSize: 10,
             finished: false,
 
+            // =====================
+            // pagination
+            // =====================
+            pageSize: 10,
+
+            // newest feed time
             lastSeenTime: null,
 
-            cache: {
-                pages: {}
-            },
+            // cursor pagination
+            cursorCreatedAt: null,
+            cursorId: null,
 
+            // =====================
+            // pull refresh
+            // =====================
             pullDistance: 0,
             pulling: false,
             startY: 0,
+
+            // =====================
+            // scroll throttle
+            // =====================
+            ticking: false
         }
     },
 
     async mounted() {
-        await this.loadInitial()
-        window.addEventListener('scroll', this.handleScroll)
 
-        window.addEventListener('touchstart', this.touchStart)
-        window.addEventListener('touchmove', this.touchMove)
-        window.addEventListener('touchend', this.touchEnd)
+        // =====================
+        // GLOBAL CACHE HIT
+        // =====================
+        if (feedCache.posts.length > 0) {
+
+            this.posts =
+                [...feedCache.posts]
+
+            this.finished =
+                feedCache.finished
+
+            this.lastSeenTime =
+                feedCache.lastSeenTime
+
+            this.cursorCreatedAt =
+                feedCache.cursorCreatedAt
+
+            this.cursorId =
+                feedCache.cursorId
+
+            // restore scroll
+            setTimeout(() => {
+
+                window.scrollTo(
+                    0,
+                    feedCache.scrollY || 0
+                )
+
+            }, 50)
+
+        }
+
+        // =====================
+        // NO CACHE
+        // =====================
+        else {
+
+            await this.loadInitial()
+        }
+
+        window.addEventListener(
+            'scroll',
+            this.handleScroll
+        )
     },
 
     beforeUnmount() {
-        window.removeEventListener('scroll', this.handleScroll)
 
-        window.removeEventListener('touchstart', this.touchStart)
-        window.removeEventListener('touchmove', this.touchMove)
-        window.removeEventListener('touchend', this.touchEnd)
+        // save scroll
+        feedCache.scrollY =
+            window.scrollY
+
+        window.removeEventListener(
+            'scroll',
+            this.handleScroll
+        )
     },
 
     methods: {
 
         // =====================
-        // 初始化加载
+        // INITIAL LOAD
         // =====================
         async loadInitial() {
-            const { data } = await supabase
-                .from('products')
-                .select(`
-          id,
-          title,
-          price,
-          description,
-          master_name,
-          temple,
-          created_at,
-          updated_at,
-          product_images(image_url)
-        `)
-                .order('created_at', { ascending: false })
-                .limit(this.pageSize)
-
-            const mapped = (data || []).map(item => this.transform(item))
-
-            this.posts = mapped
-            this.cache.pages[0] = mapped
-
-            this.lastSeenTime = this.getLatestTime(mapped)
-        },
-
-        // =====================
-        // 分页加载（缓存 + 冷加载）
-        // =====================
-        async loadMore() {
-            if (this.loading || this.finished) return
-
-            if (this.cache.pages[this.page]) {
-                this.posts.push(...this.cache.pages[this.page])
-                this.page++
-                return
-            }
 
             this.loading = true
 
-            const from = this.page * this.pageSize
-            const to = from + this.pageSize - 1
+            const { data, error } =
+                await supabase
+                    .from('products')
+                    .select(`
+                        id,
+                        title,
+                        price,
+                        description,
+                        master_name,
+                        temple,
+                        created_at,
+                        updated_at,
+                        has_certificate,
+                        product_images(image_url)
+                    `)
+                    .order(
+                        'created_at',
+                        { ascending: false }
+                    )
+                    .order(
+                        'id',
+                        { ascending: false }
+                    )
+                    .limit(this.pageSize)
 
-            const { data } = await supabase
-                .from('products')
-                .select(`
-          id,
-          title,
-          price,
-          description,
-          master_name,
-          temple,
-          created_at,
-          updated_at,
-          product_images(image_url)
-        `)
-                .order('created_at', { ascending: false })
-                .range(from, to)
+            if (error) {
 
-            const mapped = (data || []).map(item => this.transform(item))
 
-            this.cache.pages[this.page] = mapped
 
-            this.posts.push(...mapped)
+                this.loading = false
 
-            if (mapped.length < this.pageSize) {
-                this.finished = true
+                return
             }
 
-            this.page++
+            const mapped =
+                (data || []).map(
+                    item => this.transform(item)
+                )
+
+            this.posts = mapped
+
+            this.finished =
+                mapped.length < this.pageSize
+
+            this.lastSeenTime =
+                this.getLatestTime(mapped)
+
+            // =====================
+            // cursor
+            // =====================
+            const last =
+                mapped[mapped.length - 1]
+
+            if (last) {
+
+                this.cursorCreatedAt =
+                    last.created_at
+
+                this.cursorId =
+                    last.id
+            }
+
+            // =====================
+            // sync global cache
+            // =====================
+            this.syncCache()
+
             this.loading = false
         },
 
         // =====================
-        // 增量刷新（只拉新数据）
+        // CURSOR PAGINATION
+        // =====================
+        async loadMore() {
+
+            if (
+                this.loading ||
+                this.finished
+            ) return
+
+            if (
+                !this.cursorCreatedAt ||
+                !this.cursorId
+            ) return
+
+            this.loading = true
+
+            // =====================
+            // TRUE CURSOR PAGINATION
+            // =====================
+            const { data, error } =
+                await supabase
+                    .from('products')
+                    .select(`
+                        id,
+                        title,
+                        price,
+                        description,
+                        master_name,
+                        temple,
+                        created_at,
+                        updated_at,
+                        has_certificate,
+                        product_images(image_url)
+                    `)
+
+                    .or(`created_at.lt.${this.cursorCreatedAt},and(created_at.eq.${this.cursorCreatedAt},id.lt.${this.cursorId})`)
+
+                    .order(
+                        'created_at',
+                        { ascending: false }
+                    )
+
+                    .order(
+                        'id',
+                        { ascending: false }
+                    )
+
+                    .limit(this.pageSize)
+
+            if (error) {
+
+
+
+                this.loading = false
+
+                return
+            }
+
+            const mapped =
+                (data || []).map(
+                    item => this.transform(item)
+                )
+
+            // =====================
+            // dedupe
+            // =====================
+            const exist =
+                new Set(
+                    this.posts.map(
+                        p => p.id
+                    )
+                )
+
+            const filtered =
+                mapped.filter(
+                    p => !exist.has(p.id)
+                )
+
+            this.posts.push(...filtered)
+
+            // =====================
+            // update cursor
+            // =====================
+            const last =
+                mapped[mapped.length - 1]
+
+            if (last) {
+
+                this.cursorCreatedAt =
+                    last.created_at
+
+                this.cursorId =
+                    last.id
+            }
+
+            // =====================
+            // end
+            // =====================
+            if (
+                mapped.length <
+                this.pageSize
+            ) {
+
+                this.finished = true
+            }
+
+            this.syncCache()
+
+            this.loading = false
+        },
+
+        // =====================
+        // INCREMENTAL REFRESH
         // =====================
         async refreshNew() {
-            if (this.refreshing || !this.lastSeenTime) return
+
+            if (
+                this.refreshing ||
+                !this.lastSeenTime
+            ) return
 
             this.refreshing = true
 
-            const { data } = await supabase
-                .from('products')
-                .select(`
-          id,
-          title,
-          price,
-          description,
-          master_name,
-          temple,
-          created_at,
-          updated_at,
-          product_images(image_url)
-        `)
-                .or(`created_at.gt.${this.lastSeenTime},updated_at.gt.${this.lastSeenTime}`)
-                .order('created_at', { ascending: false })
+            const time = this.lastSeenTime
 
-            const mapped = (data || []).map(item => this.transform(item))
 
-            if (mapped.length > 0) {
+            const { data, error } =
+                await supabase
+                    .from('products')
+                    .select(`
+                        id,
+                        title,
+                        price,
+                        description,
+                        master_name,
+                        temple,
+                        created_at,
+                        updated_at,
+                        has_certificate,
+                        product_images(image_url)
+                    `)
 
-                // 去重
-                const exist = new Set(this.posts.map(p => p.id))
-                const filtered = mapped.filter(p => !exist.has(p.id))
+                    .or(
+                        `created_at.gt.${time},updated_at.gt.${time}`
+                    )
 
-                this.posts = [...filtered, ...this.posts]
+                    .order(
+                        'created_at',
+                        { ascending: false }
+                    )
 
-                this.lastSeenTime = this.getLatestTime(this.posts)
+                    .order(
+                        'id',
+                        { ascending: false }
+                    )
+
+            if (error) {
+
+
+
+                this.refreshing = false
+
+                return
+            }
+
+            const mapped =
+                (data || []).map(
+                    item => this.transform(item)
+                )
+
+            // =====================
+            // dedupe
+            // =====================
+            const exist =
+                new Set(
+                    this.posts.map(
+                        p => p.id
+                    )
+                )
+
+            const filtered =
+                mapped.filter(
+                    p => !exist.has(p.id)
+                )
+
+            if (filtered.length > 0) {
+
+                this.posts = [
+                    ...filtered,
+                    ...this.posts
+                ]
+
+                this.lastSeenTime =
+                    this.getLatestTime(
+                        this.posts
+                    )
+
+                this.syncCache()
             }
 
             this.refreshing = false
         },
 
         // =====================
-        // touch 下拉刷新
+        // PULL REFRESH
         // =====================
         touchStart(e) {
-            if (window.scrollY > 0) return
 
-            this.startY = e.touches[0].clientY
+            if (
+                window.scrollY > 0
+            ) return
+
+            this.startY =
+                e.touches[0].clientY
+
             this.pulling = true
         },
 
         touchMove(e) {
-            if (!this.pulling) return
 
-            const diff = e.touches[0].clientY - this.startY
-            this.pullDistance = Math.max(0, Math.min(diff, 120))
+            if (!this.pulling)
+                return
+
+            const diff =
+                e.touches[0].clientY -
+                this.startY
+
+            this.pullDistance =
+                Math.max(
+                    0,
+                    Math.min(diff, 120)
+                )
         },
 
         async touchEnd() {
-            if (!this.pulling) return
 
-            if (this.pullDistance > 80) {
+            if (!this.pulling)
+                return
+
+            if (
+                this.pullDistance > 80
+            ) {
+
                 await this.refreshNew()
             }
 
             this.pullDistance = 0
+
             this.pulling = false
         },
 
         // =====================
-        // scroll 加载
+        // RAF SCROLL
         // =====================
         handleScroll() {
-            const scrollTop = window.scrollY
-            const windowHeight = window.innerHeight
-            const docHeight = document.documentElement.scrollHeight
 
-            if (scrollTop + windowHeight >= docHeight - 100) {
-                this.loadMore()
-            }
+            feedCache.scrollY =
+                window.scrollY
+
+            if (this.ticking)
+                return
+
+            this.ticking = true
+
+            requestAnimationFrame(() => {
+
+                const scrollTop =
+                    window.scrollY
+
+                const windowHeight =
+                    window.innerHeight
+
+                const docHeight =
+                    document.documentElement
+                        .scrollHeight
+
+                if (
+                    scrollTop +
+                    windowHeight >=
+                    docHeight - 100
+                ) {
+
+                    this.loadMore()
+                }
+
+                this.ticking = false
+            })
         },
 
         // =====================
-        // 工具函数
+        // TRANSFORM
         // =====================
         transform(item) {
+
             return {
+
                 id: item.id,
-                image: item.product_images?.[0]?.image_url,
-                title: item.title,
-                price: item.price,
-                master_name: item.master_name,
-                temple: item.temple,
-                created_at: item.created_at,
-                updated_at: item.updated_at,
-                description: item.description
+
+                image:
+                    item.product_images?.[0]
+                        ?.image_url || '',
+
+                title:
+                    item.title,
+
+                price:
+                    item.price,
+
+                description:
+                    item.description,
+
+                master_name:
+                    item.master_name,
+
+                temple:
+                    item.temple,
+
+                created_at:
+                    item.created_at,
+
+                updated_at:
+                    item.updated_at,
+
+                has_certificate:
+                    item.has_certificate
             }
         },
 
+        // =====================
+        // latest feed time
+        // =====================
         getLatestTime(list) {
-            if (!list.length) return null
+
+            if (!list.length)
+                return null
+
             return list[0].created_at
+        },
+
+        // =====================
+        // GLOBAL CACHE SYNC
+        // =====================
+        syncCache() {
+
+            feedCache.posts =
+                [...this.posts]
+
+            feedCache.finished =
+                this.finished
+
+            feedCache.lastSeenTime =
+                this.lastSeenTime
+
+            feedCache.cursorCreatedAt =
+                this.cursorCreatedAt
+
+            feedCache.cursorId =
+                this.cursorId
         }
     }
 }
 </script>
 
 <template>
-    <div>
+
+    <div @touchstart="touchStart" @touchmove="touchMove" @touchend="touchEnd">
+
         <NavBar />
-        <div class="overflow-hidden transition-all duration-300 text-center text-gray-500"
-            :style="{ height: pullDistance + 'px' }">
-            <div v-if="refreshing">
-                刷新中...
-            </div>
-            <div v-else-if="pullDistance > 80">
-                松开刷新
-            </div>
-            <div v-else>
-                下拉刷新
+
+        <!-- =====================
+        PULL REFRESH UI
+        ====================== -->
+
+        <div class="
+                fixed
+                top-16
+                left-0
+                w-full
+                z-50
+                flex
+                justify-center
+                pointer-events-none
+                transition-all
+                duration-200
+            " :style="{
+                transform:
+                    `translateY(${pullDistance}px)`
+            }">
+
+            <div v-if="
+                pullDistance > 0 ||
+                refreshing
+            " class="
+                    bg-white
+                    shadow-md
+                    px-4
+                    py-2
+                    rounded-full
+                    text-sm
+                ">
+
+                {{
+                    refreshing
+                        ? '刷新中...'
+                        : pullDistance > 80
+                            ? '释放刷新'
+                            : '下拉刷新'
+                }}
+
             </div>
         </div>
-        <div class="pt-19 columns-2 gap-1 mx-1">
 
-            <AmuletCard v-for="post in posts" :key="post.id" :post=post class="mb-1" />
-            <div v-if="loading" class="text-center py-4 text-gray-400">
-                加载中...
-            </div>
+        <!-- =====================
+        FEED
+        ====================== -->
 
-            <!-- end -->
-            <div v-if="finished" class="text-center py-4 text-gray-400">
-                没有更多了
-            </div>
+        <div class="
+                pt-20
+                columns-2
+                gap-2
+                mx-2
+            ">
+
+            <AmuletCard v-for="post in posts" :key="post.id" :post="post" class="
+                    mb-2
+                    break-inside-avoid
+                " />
+
         </div>
+
+        <!-- =====================
+        LOADING
+        ====================== -->
+
+        <div v-if="loading" class="
+                text-center
+                py-4
+                text-gray-400
+            ">
+            加载中...
+        </div>
+
+        <!-- =====================
+        END
+        ====================== -->
+
+        <div v-if="finished" class="
+                text-center
+                py-4
+                text-gray-400
+            ">
+            没有更多了
+        </div>
+
     </div>
+
 </template>
